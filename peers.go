@@ -13,13 +13,19 @@ var (
 // be backed by any concrete transport: local, HTTP, net/rpc, etc. Peers must be
 // encoding/gob encodable.
 type Peer interface {
+	// 获取 Server 标识接口
 	id() uint64
+	// 日志追加接口
 	callAppendEntries(appendEntries) appendEntriesResponse
+	// 投票选举接口
 	callRequestVote(requestVote) requestVoteResponse
+	// 命令调用接口
 	callCommand([]byte, chan<- []byte) error
+	// 集群配置变化接口
 	callSetConfiguration(...Peer) error
 }
 
+// 用于测试。
 // localPeer is the simplest kind of peer, mapped to a server in the
 // same process-space. Useful for testing and demonstration; not so
 // useful for networks of independent processes.
@@ -31,10 +37,12 @@ func newLocalPeer(server *Server) *localPeer { return &localPeer{server} }
 
 func (p *localPeer) id() uint64 { return p.server.id }
 
+// 追加日志。
 func (p *localPeer) callAppendEntries(ae appendEntries) appendEntriesResponse {
 	return p.server.appendEntries(ae)
 }
 
+// 投票选举。
 func (p *localPeer) callRequestVote(rv requestVote) requestVoteResponse {
 	return p.server.requestVote(rv)
 }
@@ -43,6 +51,7 @@ func (p *localPeer) callCommand(cmd []byte, response chan<- []byte) error {
 	return p.server.Command(cmd, response)
 }
 
+// 配置变更。
 func (p *localPeer) callSetConfiguration(peers ...Peer) error {
 	return p.server.SetConfiguration(peers...)
 }
@@ -105,6 +114,7 @@ func (pm peerMap) quorum() int {
 	}
 }
 
+// requestVotes 向所有的节点发送投票请求，如果在超时时间内没有收到响应，会进行重试。
 // requestVotes sends the passed requestVote RPC to every peer in Peers. It
 // forwards responses along the returned requestVoteResponse channel. It makes
 // the RPCs with a timeout of BroadcastInterval * 2 (chosen arbitrarily). Peers
@@ -161,6 +171,7 @@ func (pm peerMap) requestVotes(r requestVote) (chan voteResponseTuple, canceler)
 	return tupleChan, cancel(abortChan)
 }
 
+// 选举响应消息。
 type voteResponseTuple struct {
 	id       uint64
 	response requestVoteResponse

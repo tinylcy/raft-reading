@@ -11,20 +11,33 @@ import (
 )
 
 var (
+	// 任期号太小
 	errTermTooSmall    = errors.New("term too small")
+	// 日志索引太小
 	errIndexTooSmall   = errors.New("index too small")
+	// 日志索引太大
 	errIndexTooBig     = errors.New("commit index too big")
+	// 日志条目内容已损坏
 	errInvalidChecksum = errors.New("invalid checksum")
+	// 无效的命令
 	errNoCommand       = errors.New("no command")
+	// 错误的日志索引
 	errBadIndex        = errors.New("bad index")
+	// 错误任期号
 	errBadTerm         = errors.New("bad term")
 )
 
+// 日志结构
 type raftLog struct {
+	// 日志读写锁
 	sync.RWMutex
+	// 日志存储接口
 	store     io.Writer
+	// 日志镜像，存储于内存
 	entries   []logEntry
+	// 下一条日志 commit 索引
 	commitPos int
+	// `操作`回调函数
 	apply     func(uint64, []byte) []byte
 }
 
@@ -39,6 +52,7 @@ func newRaftLog(store io.ReadWriter, apply func(uint64, []byte) []byte) *raftLog
 	return l
 }
 
+// 将存储在持久设备的日志条目恢复到内存中。 
 // recover reads from the log's store, to populate the log with log entries
 // from persistent storage. It should be called once, at log instantiation.
 func (l *raftLog) recover(r io.Reader) error {
@@ -52,6 +66,7 @@ func (l *raftLog) recover(r io.Reader) error {
 				return err
 			}
 			l.commitPos++
+			// 将日志应用到状态机
 			l.apply(entry.Index, entry.Command)
 		default:
 			return err // unsuccessful completion
@@ -59,6 +74,7 @@ func (l *raftLog) recover(r io.Reader) error {
 	}
 }
 
+// 获取索引 index 之后的所有日志条目。
 // entriesAfter returns a slice of log entries after (i.e. not including) the
 // passed index, and the term of the log entry specified by index, as a
 // convenience to the caller. (This function is only used by a leader attempting
@@ -100,12 +116,13 @@ func stripResponseChannels(a []logEntry) []logEntry {
 			Index:           entry.Index,
 			Term:            entry.Term,
 			Command:         entry.Command,
-			commandResponse: nil,
+			commandResponse: nil, // 将 commandResponse channel 设置为 nil
 		}
 	}
 	return stripped
 }
 
+// 判断日志条目中是否包含特定 index 和 term 的日志项。
 // contains returns true if a log entry with the given index and term exists in
 // the log.
 func (l *raftLog) contains(index, term uint64) bool {
@@ -124,6 +141,7 @@ func (l *raftLog) contains(index, term uint64) bool {
 	return false
 }
 
+// 将 {index, term} 之后的日志项全部清空。
 // ensureLastIs deletes all non-committed log entries after the given index and
 // term. It will fail if the given index doesn't exist, has already been
 // committed, or doesn't match the given term.
@@ -144,6 +162,7 @@ func (l *raftLog) ensureLastIs(index, term uint64) error {
 		return errIndexTooBig
 	}
 
+	// Leader 决定重建日志条目，此时不能存在已经 committed 的日志条目。
 	// It's possible that the passed index is 0. It means the leader has come to
 	// decide we need a complete log rebuild. Of course, that's only valid if we
 	// haven't committed anything, so this check comes after that one.
@@ -181,6 +200,8 @@ func (l *raftLog) ensureLastIs(index, term uint64) error {
 		break // good
 	}
 
+	// 已经找到满足特定 index 和 term 的日志项。
+
 	// Sanity check.
 	if pos < l.commitPos {
 		panic("index >= commitIndex, but pos < commitPos")
@@ -193,6 +214,7 @@ func (l *raftLog) ensureLastIs(index, term uint64) error {
 		return nil // nothing to truncate
 	}
 
+	// 删除 {index, term} 之后的所有日志项。
 	// If we blow away log entries that haven't yet sent responses to clients,
 	// signal the clients to stop waiting, by closing the channel without a
 	// response value.
@@ -215,6 +237,7 @@ func (l *raftLog) ensureLastIs(index, term uint64) error {
 	return nil
 }
 
+// 获取最新的已经 committed 的日志项对应的 index。
 // getCommitIndex returns the commit index of the log. That is, the index of the
 // last log entry which can be considered committed.
 func (l *raftLog) getCommitIndex() uint64 {
@@ -247,6 +270,7 @@ func (l *raftLog) lastIndexWithLock() uint64 {
 	return l.entries[len(l.entries)-1].Index
 }
 
+// 获取最后一个日志项的 term。
 // lastTerm returns the term of the most recent log entry.
 func (l *raftLog) lastTerm() uint64 {
 	l.RLock()
@@ -261,6 +285,7 @@ func (l *raftLog) lastTermWithLock() uint64 {
 	return l.entries[len(l.entries)-1].Term
 }
 
+// 追加日志项。
 // appendEntry appends the passed log entry to the log. It will return an error
 // if the entry's term is smaller than the log's most recent term, or if the
 // entry's index is too small relative to the log's most recent entry.
@@ -270,19 +295,23 @@ func (l *raftLog) appendEntry(entry logEntry) error {
 
 	if len(l.entries) > 0 {
 		lastTerm := l.lastTermWithLock()
+		// 如果待追加的日志项的 term 小于日志条目中最后一项日志的 term，返回错误。
 		if entry.Term < lastTerm {
 			return errTermTooSmall
 		}
 		lastIndex := l.lastIndexWithLock()
+		// 如果 term 相同，但是待追加日志项的 index 小于日志条目中最后一项日志的 index，返回错误。
 		if entry.Term == lastTerm && entry.Index <= lastIndex {
 			return errIndexTooSmall
 		}
 	}
 
+	// 成功追加日志项。
 	l.entries = append(l.entries, entry)
 	return nil
 }
 
+// 将 commitIndex 之前（包含 commitIndex）的所有日志项 commit。
 // commitTo commits all log entries up to and including the passed commitIndex.
 // Commit means: synchronize the log entry to persistent storage, and call the
 // state machine apply function for the log entry's command.
@@ -304,6 +333,8 @@ func (l *raftLog) commitTo(commitIndex uint64) error {
 		return errIndexTooBig
 	}
 
+	// 传递的 commitIndex 必须恰好等于当前最后一项已经 committed 的日志项的 index。
+
 	// If we've already committed to the commitIndex, great!
 	if commitIndex == l.getCommitIndexWithLock() {
 		return nil
@@ -315,6 +346,7 @@ func (l *raftLog) commitTo(commitIndex uint64) error {
 		panic("pending commit pos < 0")
 	}
 
+	// 把已经 committed 日志项的 index 和参数 commitIndex 之间的日志项 commit。
 	// Commit entries between our existing commit index and the passed index.
 	// Remember to include the passed index.
 	for {
@@ -333,6 +365,7 @@ func (l *raftLog) commitTo(commitIndex uint64) error {
 
 		// Forward non-configuration commands to the state machine.
 		// Send the responses to the waiting client, if applicable.
+		// 如果不是配置类型的 Log，调用 apply 函数。
 		if !l.entries[pos].isConfiguration {
 			resp := l.apply(l.entries[pos].Index, l.entries[pos].Command)
 			if l.entries[pos].commandResponse != nil {
@@ -354,6 +387,7 @@ func (l *raftLog) commitTo(commitIndex uint64) error {
 			l.entries[pos].committed = nil
 		}
 
+		// 更新 commitPos。
 		// Mark our commit position cursor.
 		l.commitPos = pos
 
@@ -377,20 +411,28 @@ func (l *raftLog) commitTo(commitIndex uint64) error {
 	return nil
 }
 
+// 日志项结构体。
 // logEntry is the atomic unit being managed by the distributed log. A log entry
 // always has an index (monotonically increasing), a term in which the Raft
 // network leader first sees the entry, and a command. The command is what gets
 // executed against the node state machine when the log entry is successfully
 // replicated.
 type logEntry struct {
+	// 日志索引
 	Index           uint64        `json:"index"`
+	// 日志任期
 	Term            uint64        `json:"term"` // when received by leader
+	// 日志内容
 	Command         []byte        `json:"command,omitempty"`
+	// 是否已经 committed
 	committed       chan bool     `json:"-"`
+	// 响应
 	commandResponse chan<- []byte `json:"-"` // only non-nil on receiver's log
+	// 日志类型
 	isConfiguration bool          `json:"-"` // for configuration change entries
 }
 
+// 序列化日志项。
 // encode serializes the log entry to the passed io.Writer.
 //
 // Entries are serialized in a simple binary format:
@@ -430,6 +472,7 @@ func (e *logEntry) encode(w io.Writer) error {
 	return err
 }
 
+// 反序列化日志项。
 // decode deserializes one log entry from the passed io.Reader.
 func (e *logEntry) decode(r io.Reader) error {
 	header := make([]byte, 24)
