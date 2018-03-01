@@ -15,6 +15,7 @@ import (
 	"time"
 )
 
+// 角色
 const (
 	follower  = "Follower"
 	candidate = "Candidate"
@@ -26,6 +27,7 @@ const (
 	noVote        = 0
 )
 
+// 选举超时时间范围
 var (
 	// MinimumElectionTimeoutMS can be set at package initialization. It may be
 	// raised to achieve more reliable replication in slow networks, or lowered
@@ -46,6 +48,7 @@ var (
 	errAlreadyRunning        = errors.New("already running")
 )
 
+// 重置选举超时时间，包括最大超时时间和最小超时时间。
 // resetElectionTimeoutMS sets the minimum and maximum election timeouts to the
 // passed values, and returns the old values.
 func resetElectionTimeoutMS(newMin, newMax int) (int, int) {
@@ -66,6 +69,8 @@ func maximumElectionTimeout() time.Duration {
 	return time.Duration(maximumElectionTimeoutMS) * time.Millisecond
 }
 
+// 获得一个超时时间，并且是在最小超时时间和最大超时时间范围内。
+// 选举超时时间随机函数。
 // electionTimeout returns a variable time.Duration, between the minimum and
 // maximum election timeouts.
 func electionTimeout() time.Duration {
@@ -74,6 +79,7 @@ func electionTimeout() time.Duration {
 	return time.Duration(d) * time.Millisecond
 }
 
+// 广播时间间隔，用于发送心跳消息。广播消息时间间隔应该远小于选举时间间隔，否则会发生选举。
 // broadcastInterval returns the interval between heartbeats (AppendEntry RPCs)
 // broadcast from the leader. It is the minimum election timeout / 10, as
 // dictated by the spec: BroadcastInterval << ElectionTimeout << MTBF.
@@ -122,12 +128,19 @@ func (s *protectedBool) Set(value bool) {
 // In a typical application, each running process that wants to be part of
 // the distributed state machine will contain a server component.
 type Server struct {
+	// 节点标识
 	id      uint64 // id of this server
+	// 节点状态
 	state   *protectedString
+	// 节点是否在运行
 	running *protectedBool
+	// 当前 Leader 标识
 	leader  uint64 // who we believe is the leader
+	// 当前任期号
 	term    uint64 // "current term number, which increases monotonically"
+	// 当前任期内获得投票的节点标识
 	vote    uint64 // who we voted for this term, if applicable
+	// 日志条目
 	log     *raftLog
 	config  *configuration
 
@@ -140,6 +153,7 @@ type Server struct {
 	quit         chan chan struct{}
 }
 
+// ApplyFunc 是客户端提供的函数，用于变更状态机状态。 
 // ApplyFunc is a client-provided function that should apply a successfully
 // replicated state transition, represented by cmd, to the local state machine,
 // and return a response. commitIndex is the sequence number of the state
@@ -149,6 +163,7 @@ type Server struct {
 // MinimumElectionTimeout.
 type ApplyFunc func(commitIndex uint64, cmd []byte) []byte
 
+// 初始化一个新的 Raft Server。
 // NewServer returns an initialized, un-started server. The ID must be unique in
 // the Raft network, and greater than 0. The store will be used by the
 // distributed log as a persistence layer. It's read-from during creation, in
@@ -164,6 +179,7 @@ func NewServer(id uint64, store io.ReadWriter, a ApplyFunc) *Server {
 		panic("server id must be > 0")
 	}
 
+	// 构建日志，会从持久化存储介质中还原日志。
 	// 5.2 Leader election: "the latest term this server has seen is persisted,
 	// and is initialized to 0 on first boot."
 	log := newRaftLog(store, a)
@@ -195,6 +211,8 @@ type configurationTuple struct {
 	Err   chan error
 }
 
+// 设置与当前 Raft 节点互相通信的节点集合。
+// 该函数需要在启动 Raft 节点前被调用。如果在启动后调用会使用 join-consensus 机制。
 // SetConfiguration sets the peers that this server will attempt to communicate
 // with. The set peers should include a peer that represents this server.
 // SetConfiguration must be called before starting the server. Calls to
@@ -231,12 +249,15 @@ func (s *Server) Stop() {
 	s.logGeneric("server stopped")
 }
 
+// 指令元组
 type commandTuple struct {
+	// 指令
 	Command         []byte
 	CommandResponse chan<- []byte
 	Err             chan error
 }
 
+// Command 将命令追加到日志中。
 // Command appends the passed command to the leader log. If error is nil, the
 // command will eventually get replicated throughout the Raft network. When the
 // command gets committed to the local server log, it's passed to the apply
@@ -324,6 +345,7 @@ func (s *Server) logAppendEntriesResponse(req appendEntries, resp appendEntriesR
 		stepDown,
 	)
 }
+
 func (s *Server) logRequestVoteResponse(req requestVote, resp requestVoteResponse, stepDown bool) {
 	s.logGeneric(
 		"got RequestVote, candidate=%d: responded with granted=%v (reason='%s') stepDown=%v",
@@ -340,6 +362,7 @@ func (s *Server) handleQuit(q chan struct{}) {
 	close(q)
 }
 
+// 如果当前节点不是 Leader 节点，那么当前节点会将指令转发给 Leader 节点。  
 func (s *Server) forwardCommand(t commandTuple) {
 	switch s.leader {
 	case unknownLeader:
@@ -381,6 +404,7 @@ func (s *Server) forwardConfiguration(t configurationTuple) {
 	}
 }
 
+// Follower 节点逻辑。
 func (s *Server) followerSelect() {
 	for {
 		select {
@@ -388,12 +412,15 @@ func (s *Server) followerSelect() {
 			s.handleQuit(q)
 			return
 
+		// 命令转发
 		case t := <-s.commandChan:
 			s.forwardCommand(t)
-
+		
+		// 配置变更
 		case t := <-s.configurationChan:
 			s.forwardConfiguration(t)
-
+		
+		// 选举超时
 		case <-s.electionTick:
 			// 5.2 Leader election: "A follower increments its current term and
 			// transitions to candidate state."
@@ -403,13 +430,14 @@ func (s *Server) followerSelect() {
 				continue
 			}
 			s.logGeneric("election timeout, becoming candidate")
-			s.term++
+			s.term++   // 自增任期号
 			s.vote = noVote
 			s.leader = unknownLeader
-			s.state.Set(candidate)
-			s.resetElectionTimeout()
+			s.state.Set(candidate)   // 状态变更为 Candidate 
+			s.resetElectionTimeout() 
 			return
-
+		
+		// 日志追加
 		case t := <-s.appendEntriesChan:
 			if s.leader == unknownLeader {
 				s.leader = t.Request.LeaderID
@@ -426,7 +454,8 @@ func (s *Server) followerSelect() {
 				s.logGeneric("following new leader=%d", t.Request.LeaderID)
 				s.leader = t.Request.LeaderID
 			}
-
+		
+		// 收到投票请求
 		case t := <-s.requestVoteChan:
 			resp, stepDown := s.handleRequestVote(t.Request)
 			s.logRequestVoteResponse(t.Request, resp, stepDown)
@@ -443,6 +472,7 @@ func (s *Server) followerSelect() {
 	}
 }
 
+// Candidate 节点逻辑。
 func (s *Server) candidateSelect() {
 	if s.leader != unknownLeader {
 		panic("known leader when entering candidateSelect")
@@ -456,6 +486,7 @@ func (s *Server) candidateSelect() {
 	// receives no response for an RPC, it reissues the RPC repeatedly until a
 	// response arrives or the election concludes."
 
+	// 节点成为 Candidate 后会将其他节点广播投票消息，如果存在不响应的节点，Candidate 会进行重试。
 	requestVoteResponses, canceler := s.config.allPeers().except(s.id).requestVotes(requestVote{
 		Term:         s.term,
 		CandidateID:  s.id,
@@ -478,6 +509,10 @@ func (s *Server) candidateSelect() {
 		return
 	}
 
+	// Candidate 在此处会不断的循环，直至出现以下三种情况：
+	// (1) 当前 Candidate 赢得选举
+	// (2) 其他节点已经赢得了选举
+	// (3) 一段时间后没有 Candidate 赢得选举
 	// "A candidate continues in this state until one of three things happens:
 	// (a) it wins the election, (b) another server establishes itself as
 	// leader, or (c) a period of time goes by with no winner."
@@ -570,6 +605,7 @@ func (s *Server) candidateSelect() {
 //
 //
 
+// 在 Leader 保存的为每个 Follower 维护的 NextIndex。
 type nextIndex struct {
 	sync.RWMutex
 	m map[uint64]uint64 // followerId: nextIndex
@@ -646,6 +682,8 @@ func (ni *nextIndex) set(id, index, prev uint64) (uint64, error) {
 	return index, nil
 }
 
+// flush 向 Follower 同步发送 AppendEntries 请求，用于心跳和日志复制。如果某个节点没有响应
+// Leader 会阻塞（会不会重试？）。
 // flush generates and forwards an appendEntries request that attempts to bring
 // the given follower "in sync" with our log. It's idempotent, so it's used for
 // both heartbeats and replicating commands.
@@ -738,6 +776,7 @@ func (s *Server) concurrentFlush(pm peerMap, ni *nextIndex, timeout time.Duratio
 	return successes, stepDown
 }
 
+// Leader 运行逻辑。
 func (s *Server) leaderSelect() {
 	if s.leader != s.id {
 		panic(fmt.Sprintf("leader (%d) not me (%d) when entering leaderSelect", s.leader, s.id))
@@ -926,11 +965,13 @@ func (s *Server) leaderSelect() {
 	}
 }
 
+// 处理投票请求。
 // handleRequestVote will modify s.term and s.vote, but nothing else.
 // stepDown means you need to: s.leader=unknownLeader, s.state.Set(Follower).
 func (s *Server) handleRequestVote(rv requestVote) (requestVoteResponse, bool) {
 	// Spec is ambiguous here; basing this (loosely!) on benbjohnson's impl
 
+	// 如果请求中 term 小于当前节点 term，拒绝投票。
 	// If the request is from an old term, reject
 	if rv.Term < s.term {
 		return requestVoteResponse{
@@ -940,6 +981,7 @@ func (s *Server) handleRequestVote(rv requestVote) (requestVoteResponse, bool) {
 		}, false
 	}
 
+	// 如果请求中包含了更新的 term，构建一个赞同的响应，并把 stepDown 设置为 true。
 	// If the request is from a newer term, reset our state
 	stepDown := false
 	if rv.Term > s.term {
@@ -950,6 +992,7 @@ func (s *Server) handleRequestVote(rv requestVote) (requestVoteResponse, bool) {
 		stepDown = true
 	}
 
+	// 如果当前节点已经是 Leader，并且 stepDown 并没有被设置为 true（说明请求中的 term 与当前节点的 term 相同），拒绝投票。
 	// Special case: if we're the leader, and we haven't been deposed by a more
 	// recent term, then we should always deny the vote
 	if s.state.Get() == leader && !stepDown {
@@ -960,6 +1003,7 @@ func (s *Server) handleRequestVote(rv requestVote) (requestVoteResponse, bool) {
 		}, stepDown
 	}
 
+	// 如果已经投过票了，拒绝投票。
 	// If we've already voted for someone else this term, reject
 	if s.vote != 0 && s.vote != rv.CandidateID {
 		if stepDown {
@@ -996,6 +1040,7 @@ func (s *Server) handleRequestVote(rv requestVote) (requestVoteResponse, bool) {
 	}, stepDown
 }
 
+// 日志追加处理逻辑。
 // handleAppendEntries will modify s.term and s.vote, but nothing else.
 // stepDown means you need to: s.leader=r.LeaderID, s.state.Set(Follower).
 func (s *Server) handleAppendEntries(r appendEntries) (appendEntriesResponse, bool) {
@@ -1004,7 +1049,8 @@ func (s *Server) handleAppendEntries(r appendEntries) (appendEntriesResponse, bo
 	// Maybe a nicer way to handle this is to define explicit handler functions
 	// for each Server state. Then, we won't try to hide too much logic (i.e.
 	// too many protocol rules) in one code path.
-
+	
+	// 如果日志追加请求中包含过时的 term，拒绝。
 	// If the request is from an old term, reject
 	if r.Term < s.term {
 		return appendEntriesResponse{
